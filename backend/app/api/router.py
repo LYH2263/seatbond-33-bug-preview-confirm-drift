@@ -2,7 +2,8 @@ import secrets
 from datetime import datetime, timedelta
 
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import select
+from sqlalchemy import select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.config import settings
@@ -148,7 +149,10 @@ def _find_block(
 
 @api_router.post("/holds/precheck", response_model=PrecheckOut)
 def precheck_hold(body: PrecheckRequest, db: Session = Depends(get_db)):
-    """预检：算出将占用的排与起止列并发短时确认令牌；不写持座，座位图热力不变。"""
+    """预检：只算出将占用的排与起止列并发短时确认令牌。
+
+    预检不落任何持座记录、不占座，座位图热力与持座列表均保持不变。
+    """
     block = _find_block(db, body.showtime_id, body.party_size, body.preferred_row)
     if block is None:
         db.add(
@@ -171,16 +175,8 @@ def precheck_hold(body: PrecheckRequest, db: Session = Depends(get_db)):
         expires_at=datetime.utcnow() + timedelta(seconds=settings.hold_token_ttl_seconds),
     )
     db.add(tok)
-    ghost = SeatHold(
-        showtime_id=tok.showtime_id,
-        order_code=f"PV-{tok.token[:6]}",
-        row=tok.row,
-        start_col=tok.start_col,
-        end_col=tok.end_col,
-        party_size=tok.party_size,
-    )
-    db.add(ghost)
     db.commit()
+    db.refresh(tok)
     return PrecheckOut(
         token=tok.token,
         showtime_id=tok.showtime_id,
@@ -192,9 +188,25 @@ def precheck_hold(body: PrecheckRequest, db: Session = Depends(get_db)):
     )
 
 
+def _log_and_raise(db: Session, tok: HoldToken, reason: str) -> None:
+    """确认被拒绝：落冲突日志（坐标与当次预检一致），再以 409 拒绝。"""
+    db.add(
+        ConflictLog(
+            showtime_id=tok.showtime_id,
+            party_size=tok.party_size,
+            reason=reason,
+        )
+    )
+    db.commit()
+    raise HTTPException(409, f"{reason}，请重新预检")
+
+
 @api_router.post("/holds/confirm", response_model=HoldOut)
 def confirm_hold(body: ConfirmRequest, db: Session = Depends(get_db)):
-    """确认：令牌有效且目标座位仍空闲才落库；令牌仅可成功确认一次。"""
+    """确认：令牌未用过、未过期、且当次预检坐标仍空闲，才按该坐标落库。
+
+    坐标一律以令牌为准，不重新选座；同一令牌只允许成功确认一次。
+    """
     tok = db.scalar(select(HoldToken).where(HoldToken.token == body.token))
     if tok is None:
         raise HTTPException(404, "确认令牌不存在，请重新预检")
@@ -202,21 +214,48 @@ def confirm_hold(body: ConfirmRequest, db: Session = Depends(get_db)):
         raise HTTPException(409, "该令牌已确认过，请重新预检")
 
     now = datetime.utcnow()
-    block = _find_block(db, tok.showtime_id, tok.party_size, None)
-    if block is None:
-        block = HoldSpan(row=tok.row, start_col=tok.start_col, end_col=tok.end_col)
+    if tok.expires_at <= now:
+        _log_and_raise(db, tok, f"确认令牌已过期（第{tok.row}排 {tok.start_col}-{tok.end_col}列）")
 
-    code = f"SB-{int(datetime.utcnow().timestamp()) % 100000:05d}"
+    candidate = HoldSpan(row=tok.row, start_col=tok.start_col, end_col=tok.end_col)
+    clashes = conflicts_with(_hold_spans(db, tok.showtime_id), candidate)
+    if clashes:
+        hit = clashes[0]
+        _log_and_raise(
+            db,
+            tok,
+            f"预检座位已被占用：第{tok.row}排 {tok.start_col}-{tok.end_col}列"
+            f"（与既有持座 第{hit.row}排 {hit.start_col}-{hit.end_col}列 重叠）",
+        )
+
+    code = f"SB-{int(now.timestamp()) % 100000:05d}"
     hold = SeatHold(
         showtime_id=tok.showtime_id,
         order_code=code,
-        row=block.row,
-        start_col=block.start_col,
-        end_col=block.end_col,
+        row=tok.row,
+        start_col=tok.start_col,
+        end_col=tok.end_col,
         party_size=tok.party_size,
     )
-    tok.used_at = now
     db.add(hold)
-    db.commit()
+    # 条件更新：仅在令牌仍未使用时占用它，挡住并发的重复确认。
+    claimed = db.execute(
+        update(HoldToken)
+        .where(HoldToken.id == tok.id, HoldToken.used_at.is_(None))
+        .values(used_at=now)
+    )
+    if claimed.rowcount != 1:
+        db.rollback()
+        raise HTTPException(409, "该令牌已确认过，请重新预检")
+    try:
+        db.commit()
+    except IntegrityError:
+        # 极端竞态：校验与提交之间同坐标被他人落库（uq_hold_span 兜底）
+        db.rollback()
+        _log_and_raise(
+            db,
+            tok,
+            f"预检座位已被占用：第{tok.row}排 {tok.start_col}-{tok.end_col}列",
+        )
     db.refresh(hold)
     return hold

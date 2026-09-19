@@ -82,6 +82,8 @@ export default function HoldPage() {
       setPre(null);
       setLast(hold);
       setMsg(`已锁座 ${hold.order_code}：第${hold.row}排 ${hold.start_col}-${hold.end_col}`);
+      // 通知票根栏等持座列表立即刷新，不必等轮询
+      window.dispatchEvent(new Event("seatbond:holds-changed"));
     } catch (e) {
       // 令牌过期或座位被占：丢弃预检结果，要求重新预检
       setPre(null);

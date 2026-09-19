@@ -75,6 +75,27 @@ def test_confirm_creates_exactly_one_hold(client, showtime_id):
     assert holds[0]["id"] == hold["id"]
 
 
+def test_confirm_uses_token_coords_even_when_other_seats_taken(client, showtime_id):
+    # 空厅预检得到最左连续块（第1排 1-3）
+    pre = _precheck(client, showtime_id, 3).json()
+    assert (pre["row"], pre["start_col"], pre["end_col"]) == (1, 1, 3)
+
+    # 他人占了同排右侧 5-7（过道在 4,5，故实际落在 6-8 一段），不与令牌坐标重叠
+    _insert_hold(showtime_id, 1, 6, 8, 3)
+
+    r = _confirm(client, pre["token"])
+    assert r.status_code == 200, r.text
+    hold = r.json()
+    # 落库坐标必须与当次预检完全一致，不得重新选座漂移
+    assert (hold["row"], hold["start_col"], hold["end_col"]) == (
+        pre["row"],
+        pre["start_col"],
+        pre["end_col"],
+    )
+    holds = _holds(client)
+    assert len(holds) == 2
+
+
 def test_second_confirm_with_same_token_fails(client, showtime_id):
     pre = _precheck(client, showtime_id, 2).json()
     assert _confirm(client, pre["token"]).status_code == 200

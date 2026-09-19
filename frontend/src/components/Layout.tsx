@@ -27,15 +27,24 @@ export default function Layout() {
   const [holds, setHolds] = useState<Hold[]>([]);
 
   useEffect(() => {
-    api<Hold[]>("/holds")
-      .then(setHolds)
-      .catch(() => setHolds([]));
-    const t = setInterval(() => {
+    let alive = true;
+    const load = () =>
       api<Hold[]>("/holds")
-        .then(setHolds)
-        .catch(() => {});
-    }, 8000);
-    return () => clearInterval(t);
+        .then((h) => {
+          if (alive) setHolds(h);
+        })
+        .catch(() => {
+          if (alive) setHolds([]);
+        });
+    load();
+    const t = setInterval(load, 8000);
+    // 锁座确认/拒绝后立即刷新，不等下一次轮询
+    window.addEventListener("seatbond:holds-changed", load);
+    return () => {
+      alive = false;
+      clearInterval(t);
+      window.removeEventListener("seatbond:holds-changed", load);
+    };
   }, [loc.pathname]);
 
   const active = holds.filter((h) => h.status === "held" || h.status === "active").slice(0, 6);

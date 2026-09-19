@@ -171,15 +171,6 @@ def precheck_hold(body: PrecheckRequest, db: Session = Depends(get_db)):
         expires_at=datetime.utcnow() + timedelta(seconds=settings.hold_token_ttl_seconds),
     )
     db.add(tok)
-    ghost = SeatHold(
-        showtime_id=tok.showtime_id,
-        order_code=f"PV-{tok.token[:6]}",
-        row=tok.row,
-        start_col=tok.start_col,
-        end_col=tok.end_col,
-        party_size=tok.party_size,
-    )
-    db.add(ghost)
     db.commit()
     return PrecheckOut(
         token=tok.token,
@@ -202,9 +193,29 @@ def confirm_hold(body: ConfirmRequest, db: Session = Depends(get_db)):
         raise HTTPException(409, "该令牌已确认过，请重新预检")
 
     now = datetime.utcnow()
-    block = _find_block(db, tok.showtime_id, tok.party_size, None)
-    if block is None:
-        block = HoldSpan(row=tok.row, start_col=tok.start_col, end_col=tok.end_col)
+    if now > tok.expires_at:
+        db.add(
+            ConflictLog(
+                showtime_id=tok.showtime_id,
+                party_size=tok.party_size,
+                reason=f"确认令牌已过期：第{tok.row}排 {tok.start_col}-{tok.end_col}",
+            )
+        )
+        db.commit()
+        raise HTTPException(409, "确认令牌已过期，请重新预检")
+
+    # 落库必须就是当次预检算出的那一批座位，而非重新搜索
+    block = HoldSpan(row=tok.row, start_col=tok.start_col, end_col=tok.end_col)
+    if conflicts_with(_hold_spans(db, tok.showtime_id), block):
+        db.add(
+            ConflictLog(
+                showtime_id=tok.showtime_id,
+                party_size=tok.party_size,
+                reason=f"目标座位已被占用：第{tok.row}排 {tok.start_col}-{tok.end_col}",
+            )
+        )
+        db.commit()
+        raise HTTPException(409, "目标座位已被占用，请重新预检")
 
     code = f"SB-{int(datetime.utcnow().timestamp()) % 100000:05d}"
     hold = SeatHold(
